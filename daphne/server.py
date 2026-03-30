@@ -64,6 +64,7 @@ class Server:
         verbosity=1,
         websocket_handshake_timeout=5,
         application_close_timeout=10,
+        lifespan_shutdown_timeout=30,
         ready_callable=None,
         server_name="daphne",
     ):
@@ -84,6 +85,7 @@ class Server:
         self.websocket_connect_timeout = websocket_connect_timeout
         self.websocket_handshake_timeout = websocket_handshake_timeout
         self.application_close_timeout = application_close_timeout
+        self.lifespan_shutdown_timeout = lifespan_shutdown_timeout
         self.root_path = root_path
         self.verbosity = verbosity
         self.abort_start = False
@@ -126,11 +128,7 @@ class Server:
         reactor.callLater(1, self.application_checker)
         reactor.callLater(2, self.timeout_checker)
 
-        # Run lifespan startup, then bind endpoints. Scheduled via
-        # callWhenRunning so the reactor is live when coroutines are created.
-        # We use asyncio.ensure_future directly (not defer.ensureDeferred) to
-        # stay consistent with create_application / kill_all_applications and
-        # avoid Twisted coroutine-driver differences across Python versions.
+        # Run lifespan startup then bind endpoints once the reactor is live.
         reactor.callWhenRunning(self._schedule_lifespan_startup)
 
         # Set the asyncio reactor's event loop as global
@@ -139,7 +137,7 @@ class Server:
 
         # Verbosity 3 turns on asyncio debug to find those blocking yields
         if self.verbosity >= 3:
-            asyncio.get_event_loop().set_debug(True)
+            reactor._asyncioEventloop.set_debug(True)
 
         # Register shutdown triggers in order: lifespan first, then kill apps.
         # Twisted fires "before shutdown" triggers in registration order, so
@@ -161,6 +159,9 @@ class Server:
         Errors are surfaced via the task's done callback so they are never
         silently swallowed.
         """
+        # Use ensure_future directly (not defer.ensureDeferred) to stay consistent
+        # with create_application / kill_all_applications and avoid Twisted
+        # coroutine-driver differences across Python versions.
         task = asyncio.ensure_future(self._lifespan_startup_then_listen())
         task.add_done_callback(self._on_lifespan_startup_done)
 
@@ -180,11 +181,22 @@ class Server:
         Runs ASGI lifespan startup then binds all configured endpoints.
         No connections are accepted until startup.complete is received.
         """
-        self._lifespan_handler = LifespanHandler(self.application)
+        self._lifespan_handler = LifespanHandler(
+            self.application,
+            shutdown_timeout=self.lifespan_shutdown_timeout,
+        )
         try:
             await self._lifespan_handler.startup()
+        except RuntimeError:
+            # startup.failed was already logged as ERROR by LifespanHandler.startup()
+            self.stop()
+            return
         except Exception as exc:
-            logger.error("Lifespan startup failed, stopping server: %s", exc)
+            logger.error(
+                "Lifespan startup raised %s, stopping server: %s",
+                type(exc).__name__,
+                exc,
+            )
             self.stop()
             return
 
@@ -276,9 +288,12 @@ class Server:
         # Run it, and stash the future for later checking
         if protocol not in self.connections:
             return None
-        self.connections[protocol]["application_instance"] = asyncio.ensure_future(
+        # create_task schedules on the running loop (reactor._asyncioEventloop),
+        # which is always current here as create_application is only called
+        # during reactor execution. The loop= parameter is not needed and was
+        # deprecated in Python 3.10.
+        self.connections[protocol]["application_instance"] = asyncio.create_task(
             application_instance,
-            loop=asyncio.get_event_loop(),
         )
         return input_queue
 

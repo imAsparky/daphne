@@ -73,6 +73,17 @@ class Command(RunserverCommand):
                 "seconds (default: 5)"
             ),
         )
+        parser.add_argument(
+            "--lifespan_shutdown_timeout",
+            action="store",
+            dest="lifespan_shutdown_timeout",
+            type=int,
+            default=30,
+            help=(
+                "Specify the daphne lifespan_shutdown_timeout interval in "
+                "seconds (default: 30)"
+            ),
+        )
         if apps.is_installed("django.contrib.staticfiles"):
             parser.add_argument(
                 "--nostatic",
@@ -90,6 +101,7 @@ class Command(RunserverCommand):
     def handle(self, *args, **options):
         self.http_timeout = options.get("http_timeout", None)
         self.websocket_handshake_timeout = options.get("websocket_handshake_timeout", 5)
+        self.lifespan_shutdown_timeout = options.get("lifespan_shutdown_timeout", 30)
         # Check Channels is installed right
         if options["use_asgi"] and not hasattr(settings, "ASGI_APPLICATION"):
             raise CommandError(
@@ -145,6 +157,7 @@ class Command(RunserverCommand):
                 http_timeout=self.http_timeout,
                 root_path=getattr(settings, "FORCE_SCRIPT_NAME", "") or "",
                 websocket_handshake_timeout=self.websocket_handshake_timeout,
+                lifespan_shutdown_timeout=self.lifespan_shutdown_timeout,
             ).run()
             logger.debug("Daphne exited")
         except KeyboardInterrupt:

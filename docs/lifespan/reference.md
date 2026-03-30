@@ -172,6 +172,11 @@ Starts the lifespan task, sends `lifespan.startup`, and waits for the
 application to respond. Raises `RuntimeError` if `startup.failed` is
 received. Returns normally on `startup.complete` or graceful fallback.
 
+The `RuntimeError` is caught by `Server._lifespan_startup_then_listen()`
+without additional logging — `startup.failed` is already logged as `ERROR`
+by this method before raising. Any other unexpected exception from `startup()`
+is logged as `ERROR` by the caller with the full traceback.
+
 **`await shutdown()`**
 
 Sends `lifespan.shutdown` and waits for the application to respond. Never

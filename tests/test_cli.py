@@ -1,8 +1,11 @@
 import logging
 import os
+import sys
 from argparse import ArgumentError
 from unittest import TestCase, skipUnless
+from unittest.mock import mock_open, patch
 
+from daphne.access import AccessLogGenerator
 from daphne.cli import CommandLineInterface
 from daphne.endpoints import build_endpoint_description_strings as build
 
@@ -258,6 +261,58 @@ class TestCLIInterface(TestCase):
         Passing `--no-server-name` will set server name to '' (empty string)
         """
         self.assertCLI(["--no-server-name"], {"server_name": ""})
+
+    def test_lifespan_shutdown_timeout(self):
+        """
+        Tests that --lifespan-shutdown-timeout is passed through to the server.
+        The default is 30 seconds; a custom value overrides it.
+        """
+        self.assertCLI([], {"lifespan_shutdown_timeout": 30})
+        self.assertCLI(
+            ["--lifespan-shutdown-timeout", "60"],
+            {"lifespan_shutdown_timeout": 60},
+        )
+
+    def test_entrypoint(self):
+        """
+        Tests that entrypoint() creates an instance and calls run() with
+        sys.argv[1:], i.e. strips the program name before dispatching.
+        """
+        argv = ["daphne", "daphne:__version__"]
+        with patch("sys.argv", argv):
+            with patch.object(self.TestedCLI, "run") as mock_run:
+                self.TestedCLI.entrypoint()
+                mock_run.assert_called_once_with(["daphne:__version__"])
+
+    def test_access_log_stdout(self):
+        """
+        Passing --access-log - routes the access log to stdout.
+        """
+        cli = self.TestedCLI()
+        cli.run(["--access-log", "-", "daphne:__version__"])
+        action_logger = cli.server.init_kwargs.get("action_logger")
+        self.assertIsInstance(action_logger, AccessLogGenerator)
+        self.assertIs(action_logger.stream, sys.stdout)
+
+    def test_access_log_file(self):
+        """
+        Passing --access-log with a file path opens that file for appending.
+        """
+        with patch("builtins.open", mock_open()) as mocked_open:
+            cli = self.TestedCLI()
+            cli.run(["--access-log", "/tmp/access.log", "daphne:__version__"])
+            mocked_open.assert_called_once_with("/tmp/access.log", "a", 1)
+            action_logger = cli.server.init_kwargs.get("action_logger")
+            self.assertIsInstance(action_logger, AccessLogGenerator)
+
+    def test_abort_start_exits(self):
+        """
+        If the server sets abort_start after run(), the CLI exits with code 1.
+        """
+        with patch.object(self.TestedCLI.TestedServer, "abort_start", new=True):
+            with self.assertRaises(SystemExit) as cm:
+                self.TestedCLI().run(["daphne:__version__"])
+            self.assertEqual(cm.exception.code, 1)
 
 
 @skipUnless(os.getenv("ASGI_THREADS"), "ASGI_THREADS environment variable not set.")

@@ -105,6 +105,29 @@ should start with a slash, but not end with one; for example::
     daphne --root-path=/forum django_project.asgi:application
 
 
+Lifespan Support
+----------------
+
+Daphne supports the `ASGI Lifespan protocol
+<https://asgi.readthedocs.io/en/latest/specs/lifespan.html>`_, which allows
+applications to run startup and shutdown hooks before connections are accepted
+and after they are all closed.
+
+If your application handles a ``lifespan`` scope (for example via
+``ProtocolTypeRouter`` in Django Channels), Daphne will call it automatically.
+No connections will be accepted until the startup hook completes. If the
+startup hook fails, Daphne will log the error and exit without accepting any
+connections.
+
+If your application does not handle the lifespan protocol, Daphne falls back
+silently and starts normally.
+
+The lifespan shutdown hook has a default timeout of 30 seconds. To override
+it::
+
+    daphne --lifespan-shutdown-timeout 60 django_project.asgi:application
+
+
 Python Support
 --------------
 

@@ -114,6 +114,13 @@ class CommandLineInterface:
             default=10,
         )
         self.parser.add_argument(
+            "--lifespan-shutdown-timeout",
+            type=int,
+            dest="lifespan_shutdown_timeout",
+            help="The number of seconds to wait for the ASGI lifespan shutdown hook to complete before giving up",
+            default=30,
+        )
+        self.parser.add_argument(
             "--root-path",
             dest="root_path",
             help="The setting for the ASGI root_path variable",
@@ -276,6 +283,7 @@ class CommandLineInterface:
             websocket_connect_timeout=args.websocket_connect_timeout,
             websocket_handshake_timeout=args.websocket_connect_timeout,
             application_close_timeout=args.application_close_timeout,
+            lifespan_shutdown_timeout=args.lifespan_shutdown_timeout,
             action_logger=(
                 AccessLogGenerator(access_log_stream) if access_log_stream else None
             ),
