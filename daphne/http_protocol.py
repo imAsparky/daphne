@@ -41,9 +41,7 @@ class WebRequest(http.Request):
                 <footer>Daphne</footer>
             </body>
         </html>
-    """.replace(
-            "\n", ""
-        )
+    """.replace("\n", "")
         .replace("    ", " ")
         .replace("   ", " ")
         .replace("  ", " ")

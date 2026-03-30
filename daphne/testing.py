@@ -192,6 +192,9 @@ class TestApplication:
     """
     An application that receives one or more messages, sends a response,
     and then quits the server. For testing.
+
+    Handles the lifespan scope transparently: responds with startup.complete
+    and shutdown.complete so that lifespan startup does not block test runs.
     """
 
     setup_storage = os.path.join(tempfile.gettempdir(), "setup.testio")
@@ -202,6 +205,17 @@ class TestApplication:
         self.messages = []
 
     async def __call__(self, scope, receive, send):
+        # Handle lifespan transparently — not part of what tests exercise,
+        # but Daphne now sends it before accepting any connections.
+        if scope["type"] == "lifespan":
+            while True:
+                event = await receive()
+                if event["type"] == "lifespan.startup":
+                    await send({"type": "lifespan.startup.complete"})
+                elif event["type"] == "lifespan.shutdown":
+                    await send({"type": "lifespan.shutdown.complete"})
+                    return
+
         self.scope = scope
         # Receive input and send output
         logging.debug("test app coroutine alive")

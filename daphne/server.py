@@ -6,7 +6,6 @@ import warnings  # isort:skip
 from concurrent.futures import ThreadPoolExecutor  # isort:skip
 from twisted.internet import asyncioreactor  # isort:skip
 
-
 twisted_loop = asyncio.new_event_loop()
 if "ASGI_THREADS" in os.environ:
     twisted_loop.set_default_executor(
@@ -39,6 +38,7 @@ from twisted.logger import STDLibLogObserver, globalLogBeginner
 from twisted.web import http
 
 from .http_protocol import HTTPFactory
+from .lifespan import LifespanHandler
 from .ws_protocol import WebSocketFactory
 
 logger = logging.getLogger(__name__)
@@ -89,6 +89,7 @@ class Server:
         self.abort_start = False
         self.ready_callable = ready_callable
         self.server_name = server_name
+        self._lifespan_handler = None
         # Check our construction is actually sensible
         if not self.endpoints:
             logger.error("No endpoints. This server will not listen on anything.")
@@ -125,13 +126,12 @@ class Server:
         reactor.callLater(1, self.application_checker)
         reactor.callLater(2, self.timeout_checker)
 
-        for socket_description in self.endpoints:
-            logger.info("Configuring endpoint %s", socket_description)
-            ep = serverFromString(reactor, str(socket_description))
-            listener = ep.listen(self.http_factory)
-            listener.addCallback(self.listen_success)
-            listener.addErrback(self.listen_error)
-            self.listeners.append(listener)
+        # Run lifespan startup, then bind endpoints. Scheduled via
+        # callWhenRunning so the reactor is live when coroutines are created.
+        # We use asyncio.ensure_future directly (not defer.ensureDeferred) to
+        # stay consistent with create_application / kill_all_applications and
+        # avoid Twisted coroutine-driver differences across Python versions.
+        reactor.callWhenRunning(self._schedule_lifespan_startup)
 
         # Set the asyncio reactor's event loop as global
         # TODO: Should we instead pass the global one into the reactor?
@@ -141,13 +141,73 @@ class Server:
         if self.verbosity >= 3:
             asyncio.get_event_loop().set_debug(True)
 
+        # Register shutdown triggers in order: lifespan first, then kill apps.
+        # Twisted fires "before shutdown" triggers in registration order, so
+        # lifespan.shutdown runs before active connections are cancelled.
+        reactor.addSystemEventTrigger("before", "shutdown", self._lifespan_shutdown)
         reactor.addSystemEventTrigger("before", "shutdown", self.kill_all_applications)
+
         if not self.abort_start:
             # Trigger the ready flag if we had one
             if self.ready_callable:
                 self.ready_callable()
             # Run the reactor
             reactor.run(installSignalHandlers=self.signal_handlers)
+
+    def _schedule_lifespan_startup(self):
+        """
+        Called by reactor.callWhenRunning once the reactor is live.
+        Schedules the lifespan startup coroutine as a native asyncio Task.
+        Errors are surfaced via the task's done callback so they are never
+        silently swallowed.
+        """
+        task = asyncio.ensure_future(self._lifespan_startup_then_listen())
+        task.add_done_callback(self._on_lifespan_startup_done)
+
+    def _on_lifespan_startup_done(self, task):
+        """Done callback for the lifespan startup task."""
+        if task.cancelled():
+            logger.error("Lifespan startup task was cancelled unexpectedly")
+            self.stop()
+            return
+        exc = task.exception()
+        if exc:
+            logger.error("Unhandled error in lifespan startup: %s", exc, exc_info=exc)
+            self.stop()
+
+    async def _lifespan_startup_then_listen(self):
+        """
+        Runs ASGI lifespan startup then binds all configured endpoints.
+        No connections are accepted until startup.complete is received.
+        """
+        self._lifespan_handler = LifespanHandler(self.application)
+        try:
+            await self._lifespan_handler.startup()
+        except Exception as exc:
+            logger.error("Lifespan startup failed, stopping server: %s", exc)
+            self.stop()
+            return
+
+        for socket_description in self.endpoints:
+            logger.info("Configuring endpoint %s", socket_description)
+            ep = serverFromString(reactor, str(socket_description))
+            listener = ep.listen(self.http_factory)
+            listener.addCallback(self.listen_success)
+            listener.addErrback(self.listen_error)
+            self.listeners.append(listener)
+
+    def _lifespan_shutdown(self):
+        """
+        Registered as a "before shutdown" system event trigger.
+        Returns a Deferred so Twisted waits for completion before proceeding
+        to the next trigger (kill_all_applications).
+        Uses defer.Deferred.fromFuture — same pattern as kill_all_applications.
+        """
+        if self._lifespan_handler:
+            future = asyncio.ensure_future(self._lifespan_handler.shutdown())
+            d = defer.Deferred.fromFuture(future)
+            d.addErrback(lambda f: None)
+            return d
 
     def listen_success(self, port):
         """
@@ -319,7 +379,7 @@ class Server:
             if not application_instance.done():
                 application_instance.cancel()
                 wait_for.append(application_instance)
-        logger.info("Killed %i pending application instances", len(wait_for))
+        logger.info("Cancelling %i pending application instances", len(wait_for))
         # Make Twisted wait until they're all dead
         wait_deferred = defer.Deferred.fromFuture(asyncio.gather(*wait_for))
         wait_deferred.addErrback(lambda x: None)

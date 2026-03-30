@@ -57,6 +57,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 package-dir = { daphne = "daphne", twisted = "daphne/twisted" }
 
+[tool.setuptools.package-data]
+daphne = ["twisted/plugins/fd_endpoint.py"]
+
 [tool.setuptools.dynamic]
 version = { attr = "daphne.__version__" }
 readme = { file = "README.rst", content-type = "text/x-rst" }
@@ -79,3 +82,10 @@ skip_covered = "true"
 
 [tool.coverage.html]
 directory = "reports/coverage_html_report"
+[tool.flake8]
+per-file-ignores = [
+    "daphne/server.py: E402",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"daphne/server.py" = ["E402"]
