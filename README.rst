@@ -131,7 +131,17 @@ it::
 Python Support
 --------------
 
-Daphne requires Python 3.9 or later.
+Daphne supports Python 3.9 through 3.13.
+
+Python 3.14 is not yet fully supported. Daphne's own code is compatible
+with 3.14, but ``AsyncioSelectorReactor`` in Twisted raises a
+``RuntimeError`` on 3.14 when no event loop has been set prior to
+instantiation. This is fixed in Twisted's trunk via
+`PR #12508 <https://github.com/twisted/twisted/pull/12508>`_
+(merged September 2025), but that fix has not shipped in a stable Twisted
+release as of Twisted 25.5.0. Operators targeting Python 3.14 should
+install Twisted from trunk or watch for a Twisted release that includes
+the fix.
 
 
 Contributing
