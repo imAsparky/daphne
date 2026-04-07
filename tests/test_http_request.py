@@ -30,6 +30,12 @@ class TestHTTPRequest(DaphneTestCase):
                 "raw_path",
                 "query_string",
                 "headers",
+                # Daphne always provides scope["state"] — a shallow copy of the
+                # lifespan state dict — in every HTTP and WebSocket scope.  It is
+                # an empty dict when lifespan is not supported or nothing was
+                # stored during startup.  Listed as required (not optional) because
+                # Daphne guarantees its presence; applications can rely on it.
+                "state",
             },
             optional_keys={"scheme", "root_path", "client", "server"},
             actual_keys=scope.keys(),

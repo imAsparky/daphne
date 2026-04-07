@@ -30,6 +30,11 @@ class TestWebsocket(DaphneTestCase):
                 "raw_path",
                 "query_string",
                 "headers",
+                # Daphne always provides scope["state"] in every WebSocket
+                # scope — a shallow copy of the lifespan state dict.  It is
+                # an empty dict when lifespan is not supported or nothing was
+                # stored during startup.
+                "state",
             },
             optional_keys={"scheme", "root_path", "client", "server", "subprotocols"},
             actual_keys=scope.keys(),
