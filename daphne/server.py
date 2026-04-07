@@ -24,8 +24,20 @@ if current_reactor is not None:
         )
         del sys.modules["twisted.internet.reactor"]
         asyncioreactor.install(twisted_loop)
+        # We installed twisted_loop so we know it is the reactor's loop.
+        _daphne_loop = twisted_loop
+    else:
+        # An AsyncioSelectorReactor was already installed externally (e.g. by
+        # _reinstall_reactor() in testing.py, which creates a fresh loop and
+        # calls asyncio.set_event_loop() before reimporting this module).
+        # get_event_loop() is safe here because whoever installed the reactor
+        # must have already called set_event_loop() with the correct loop —
+        # that is the established contract for asyncio reactor installation.
+        _daphne_loop = asyncio.get_event_loop()
 else:
     asyncioreactor.install(twisted_loop)
+    # We installed twisted_loop so we know it is the reactor's loop.
+    _daphne_loop = twisted_loop
 
 import logging
 import time
@@ -38,7 +50,7 @@ from twisted.logger import STDLibLogObserver, globalLogBeginner
 from twisted.web import http
 
 from .http_protocol import HTTPFactory
-from .lifespan import LifespanHandler
+from .lifespan import LifespanHandler, _sanitise_message
 from .ws_protocol import WebSocketFactory
 
 logger = logging.getLogger(__name__)
@@ -64,6 +76,7 @@ class Server:
         verbosity=1,
         websocket_handshake_timeout=5,
         application_close_timeout=10,
+        lifespan_startup_timeout=60,
         lifespan_shutdown_timeout=30,
         ready_callable=None,
         server_name="daphne",
@@ -85,6 +98,7 @@ class Server:
         self.websocket_connect_timeout = websocket_connect_timeout
         self.websocket_handshake_timeout = websocket_handshake_timeout
         self.application_close_timeout = application_close_timeout
+        self.lifespan_startup_timeout = lifespan_startup_timeout
         self.lifespan_shutdown_timeout = lifespan_shutdown_timeout
         self.root_path = root_path
         self.verbosity = verbosity
@@ -131,13 +145,16 @@ class Server:
         # Run lifespan startup then bind endpoints once the reactor is live.
         reactor.callWhenRunning(self._schedule_lifespan_startup)
 
-        # Set the asyncio reactor's event loop as global
-        # TODO: Should we instead pass the global one into the reactor?
-        asyncio.set_event_loop(reactor._asyncioEventloop)
+        # Reset the global event loop to the one we know the reactor is using.
+        # This guards against anything between module import and run() (e.g.
+        # Django setup) having changed it. _daphne_loop is set at module import
+        # time to the loop that was installed into the reactor, using only the
+        # public asyncio API and no private Twisted attributes.
+        asyncio.set_event_loop(_daphne_loop)
 
         # Verbosity 3 turns on asyncio debug to find those blocking yields
         if self.verbosity >= 3:
-            reactor._asyncioEventloop.set_debug(True)
+            _daphne_loop.set_debug(True)
 
         # Register shutdown triggers in order: lifespan first, then kill apps.
         # Twisted fires "before shutdown" triggers in registration order, so
@@ -159,10 +176,21 @@ class Server:
         Errors are surfaced via the task's done callback so they are never
         silently swallowed.
         """
-        # Use ensure_future directly (not defer.ensureDeferred) to stay consistent
-        # with create_application / kill_all_applications and avoid Twisted
-        # coroutine-driver differences across Python versions.
-        task = asyncio.ensure_future(self._lifespan_startup_then_listen())
+        # We use asyncio.get_event_loop().create_task() rather than
+        # asyncio.create_task() or asyncio.ensure_future() for a specific
+        # reason: this method is called from a Twisted reactor.callWhenRunning
+        # callback, not from inside a coroutine. asyncio.create_task() calls
+        # get_running_loop() which raises RuntimeError when the asyncio loop is
+        # being driven by Twisted rather than loop.run_forever(). ensure_future()
+        # avoids that but is deprecated since Python 3.10.
+        # get_event_loop() is safe here because run() calls
+        # asyncio.set_event_loop(_daphne_loop) before the reactor starts, so
+        # the correct loop is always current by the time this callback fires.
+        # See: https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.loop.create_task
+        task = asyncio.get_event_loop().create_task(
+            self._lifespan_startup_then_listen(),
+            name="daphne.lifespan.startup",
+        )
         task.add_done_callback(self._on_lifespan_startup_done)
 
     def _on_lifespan_startup_done(self, task):
@@ -183,6 +211,7 @@ class Server:
         """
         self._lifespan_handler = LifespanHandler(
             self.application,
+            startup_timeout=self.lifespan_startup_timeout,
             shutdown_timeout=self.lifespan_shutdown_timeout,
         )
         try:
@@ -195,7 +224,9 @@ class Server:
             logger.error(
                 "Lifespan startup raised %s, stopping server: %s",
                 type(exc).__name__,
-                exc,
+                # Sanitise unexpected exceptions: they may carry application-supplied
+                # content such as connection strings or tokens.
+                _sanitise_message(str(exc)),
             )
             self.stop()
             return
@@ -216,7 +247,15 @@ class Server:
         Uses defer.Deferred.fromFuture — same pattern as kill_all_applications.
         """
         if self._lifespan_handler:
-            future = asyncio.ensure_future(self._lifespan_handler.shutdown())
+            # Same reasoning as _schedule_lifespan_startup: called from a
+            # Twisted "before shutdown" trigger, not a coroutine, so we use
+            # asyncio.get_event_loop().create_task() directly. get_event_loop()
+            # is safe because run() called set_event_loop(_daphne_loop) before
+            # the reactor started.
+            future = asyncio.get_event_loop().create_task(
+                self._lifespan_handler.shutdown(),
+                name="daphne.lifespan.shutdown",
+            )
             d = defer.Deferred.fromFuture(future)
             d.addErrback(lambda f: None)
             return d
@@ -280,6 +319,33 @@ class Server:
         # Make an instance of the application
         input_queue = asyncio.Queue()
         scope.setdefault("asgi", {"version": "3.0"})
+
+        # ASGI Lifespan State — defined in the ASGI lifespan spec (scope section),
+        # formalised in asgiref 3.7.0 / May 2023
+        #
+        # The lifespan sub-spec defines scope["state"] as an empty dict that the
+        # application populates during its startup hook.  The server is then
+        # required to pass a *shallow copy* of that dict into every HTTP and
+        # WebSocket scope so request handlers can access shared objects — connection
+        # pools, HTTP clients, caches — without module-level globals.
+        #
+        # Why a shallow copy?
+        #   - Each request gets its own dict object, so handlers can add or remove
+        #     keys locally without affecting other concurrent requests.
+        #   - The values themselves are shared references (not deep-copied), which
+        #     is intentional: the whole point is to share live objects like a pool.
+        #
+        # Why unconditional (not gated on _supported)?
+        #   LifespanHandler.state is always a dict (initialised to {} in __init__).
+        #   If lifespan is not supported, the app never wrote to it, so every
+        #   request just gets an empty dict — correct per the spec and harmless.
+        #   Keeping the injection unconditional avoids a conditional branch here
+        #   and means applications can always rely on scope["state"] being present.
+        scope["state"] = (
+            self._lifespan_handler.state.copy()
+            if self._lifespan_handler is not None
+            else {}
+        )
         application_instance = self.application(
             scope=scope,
             receive=input_queue.get,
@@ -288,10 +354,10 @@ class Server:
         # Run it, and stash the future for later checking
         if protocol not in self.connections:
             return None
-        # create_task schedules on the running loop (reactor._asyncioEventloop),
-        # which is always current here as create_application is only called
-        # during reactor execution. The loop= parameter is not needed and was
-        # deprecated in Python 3.10.
+        # create_task schedules on the running loop, which is always correct
+        # here: create_application is only called during reactor execution, and
+        # run() has already called asyncio.set_event_loop(_daphne_loop).
+        # The loop= parameter is not needed and was deprecated in Python 3.10.
         self.connections[protocol]["application_instance"] = asyncio.create_task(
             application_instance,
         )
